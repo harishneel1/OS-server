@@ -21,6 +21,12 @@ class ChatCreate(BaseModel):
     project_id: Optional[str] = None
     clerk_id: str
 
+class MessageCreate(BaseModel):
+    chat_id: str
+    content: str
+    role: str  # "user" or "assistant"
+    clerk_id: str
+
 # Load environment variables
 load_dotenv()
 
@@ -210,6 +216,80 @@ async def create_chat(chat: ChatCreate):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create chat: {str(e)}")
+
+
+@app.get("/api/chats/{chat_id}")
+async def get_chat(chat_id: str, clerk_id: str):
+    try:
+        # Get the chat and verify it belongs to the user
+        result = supabase.table('chats').select('*').eq('id', chat_id).eq('clerk_id', clerk_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Chat not found or access denied")
+        
+        chat = result.data[0]
+        
+        # Get messages for this chat
+        messages_result = supabase.table('messages').select('*').eq('chat_id', chat_id).order('created_at', desc=False).execute()
+        
+        # Add messages to chat object
+        chat['messages'] = messages_result.data or []
+        
+        return {
+            "message": "Chat retrieved successfully",
+            "data": chat
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get chat: {str(e)}")
+
+@app.post("/api/messages")
+async def create_message(message: MessageCreate):
+    try:
+        # Verify chat exists and belongs to user
+        chat_result = supabase.table('chats').select('*').eq('id', message.chat_id).eq('clerk_id', message.clerk_id).execute()
+        
+        if not chat_result.data:
+            raise HTTPException(status_code=404, detail="Chat not found or access denied")
+        
+        chat = chat_result.data[0]
+        
+        # Create the message
+        message_result = supabase.table('messages').insert({
+            "chat_id": message.chat_id,
+            "content": message.content,
+            "role": message.role,
+            "clerk_id": message.clerk_id
+        }).execute()
+        
+        # Update chat title if it's the first message and it's from user
+        if message.role == "user":
+            # Check if this is the first user message
+            existing_messages = supabase.table('messages').select('id').eq('chat_id', message.chat_id).execute()
+            
+            if len(existing_messages.data) == 1:  # This is the first message
+                new_title = message.content[:30] + ("..." if len(message.content) > 30 else "")
+                supabase.table('chats').update({
+                    "title": new_title,
+                    "updated_at": "now()"
+                }).eq('id', message.chat_id).execute()
+        
+        # Always update the chat's updated_at timestamp
+        supabase.table('chats').update({
+            "updated_at": "now()"
+        }).eq('id', message.chat_id).execute()
+        
+        return {
+            "message": "Message created successfully",
+            "data": message_result.data[0]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create message: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
