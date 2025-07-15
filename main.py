@@ -187,7 +187,18 @@ async def get_project_chats(project_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get project chats: {str(e)}")
 
-
+@app.get("/api/chats")
+async def get_chats(clerk_id: str):
+    try:
+        result = supabase.table('chats').select('*').eq('clerk_id', clerk_id).order('updated_at', desc=True).execute()
+        
+        return {
+            "message": "Chats retrieved successfully",
+            "data": result.data
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get chats: {str(e)}")
 
 @app.post("/api/chats")
 async def create_chat(chat: ChatCreate):
