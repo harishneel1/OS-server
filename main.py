@@ -7,19 +7,18 @@ from supabase import create_client, Client
 from pydantic import BaseModel
 from typing import Optional
 
-class ChatCreate(BaseModel):
-    title: str = "New Chat"
-    project_id: Optional[str] = None
+# Pydantic Models
+class UserCreate(BaseModel):
     clerk_id: str
-
-class ChatUpdate(BaseModel):
-    title: str = None
-    messages: list = None
-    updated_at: str = None
 
 class ProjectCreate(BaseModel):
     name: str
     description: str = ""
+    clerk_id: str
+
+class ChatCreate(BaseModel):
+    title: str
+    project_id: Optional[str] = None
     clerk_id: str
 
 # Load environment variables
@@ -43,7 +42,7 @@ app = FastAPI(
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Your Next.js frontend URL
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,38 +61,22 @@ async def health_check():
         "version": "1.0.0"
     }
 
-# Test endpoint to verify frontend connectivity
-@app.get("/api/test")
-async def test_endpoint():
-    return {
-        "message": "Frontend-Backend connection successful!",
-        "timestamp": "2024-01-01T00:00:00Z"
-    }
-
+# User endpoints
 @app.post("/api/users")
-async def create_user(user_data: dict):
+async def create_user(user: UserCreate):
     try:
-        # Extract data from request
-        clerk_id = user_data.get("clerk_id")
-        
-        if not clerk_id:
-            raise HTTPException(status_code=400, detail="clerk_id is required")
-        
         # Insert new user into database
         result = supabase.table('users').insert({
-            "clerk_id": clerk_id
+            "clerk_id": user.clerk_id
         }).execute()
-
-        print(result)
         
         return {
             "message": "User created successfully",
-            "user": result.data[0]
+            "data": result.data[0]
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
-
 
 @app.post("/api/webhooks/clerk/user-created")
 async def clerk_webhook(webhook_data: dict):
@@ -113,7 +96,10 @@ async def clerk_webhook(webhook_data: dict):
                 "clerk_id": clerk_id
             }).execute()
             
-            return {"message": "User created successfully", "clerk_id": clerk_id}
+            return {
+                "message": "User created successfully",
+                "data": result.data[0]
+            }
         
         # For other event types, just acknowledge
         return {"message": "Webhook received", "type": event_type}
@@ -121,35 +107,19 @@ async def clerk_webhook(webhook_data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Webhook processing failed: {str(e)}")
 
-@app.get("/api/db-test")
-async def test_database():
-    try:
-        # Simple query to test connection
-        result = supabase.table('users').select("*").execute()
-        return {
-            "message": "Database connection successful!",
-            "table": "users",
-            "status": "connected", 
-            "result": result
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
-
-
-
-
-# PROJECTS-RELATED APIS 
-
+# Projects endpoints
 @app.get("/api/projects")
 async def get_projects(clerk_id: str):
     try:
         result = supabase.table('projects').select('*').eq('clerk_id', clerk_id).execute()
         
-        return result.data
+        return {
+            "message": "Projects retrieved successfully",
+            "data": result.data
+        }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get projects: {str(e)}")
-
 
 @app.post("/api/projects")
 async def create_project(project: ProjectCreate):
@@ -161,10 +131,32 @@ async def create_project(project: ProjectCreate):
             "clerk_id": project.clerk_id
         }).execute()
         
-        return result.data[0] 
+        return {
+            "message": "Project created successfully",
+            "data": result.data[0]
+        }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create project: {str(e)}")
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: str, clerk_id: str):
+    try:
+        result = supabase.table('projects').select('*').eq('id', project_id).eq('clerk_id', clerk_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        return {
+            "message": "Project retrieved successfully",
+            "data": result.data[0]
+        }
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (like 404)
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get project: {str(e)}")
 
 @app.get("/api/projects/{project_id}/chats")
 async def get_project_chats(project_id: str):
@@ -178,7 +170,10 @@ async def get_project_chats(project_id: str):
         # Get chats for this project, ordered by most recent activity
         result = supabase.table('chats').select('*').eq('project_id', project_id).order('updated_at', desc=True).execute()
         
-        return result.data
+        return {
+            "message": "Project chats retrieved successfully",
+            "data": result.data
+        }
         
     except HTTPException:
         # Re-raise HTTP exceptions (like 404)
@@ -186,57 +181,35 @@ async def get_project_chats(project_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get project chats: {str(e)}")
 
-@app.get("/api/chats")
-async def get_chats(clerk_id: str):
-    try:
-        # Query chats table for this user, ordered by most recent
-        result = supabase.table('chats').select('*').eq('clerk_id', clerk_id).order('updated_at', desc=True).execute()
-        
-        return result.data
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get chats: {str(e)}")
 
-@app.get("/api/chats/{chat_id}/messages")
-async def get_chat_messages(chat_id: str):
-    try:
-        result = supabase.table('messages').select('*').eq('chat_id', chat_id).order('created_at', desc=False).execute()
-        return result.data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get messages: {str(e)}")
 
 @app.post("/api/chats")
 async def create_chat(chat: ChatCreate):
     try:
+        # If project_id is provided, verify the project exists and belongs to the user
+        if chat.project_id:
+            project_result = supabase.table('projects').select('id').eq('id', chat.project_id).eq('clerk_id', chat.clerk_id).execute()
+            
+            if not project_result.data:
+                raise HTTPException(status_code=404, detail="Project not found or access denied")
         
+        # Insert new chat into database
         result = supabase.table('chats').insert({
             "title": chat.title,
             "project_id": chat.project_id,
             "clerk_id": chat.clerk_id
         }).execute()
-                
-        return result.data[0]  
         
+        return {
+            "message": "Chat created successfully",
+            "data": result.data[0]
+        }
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (like 404)
+        raise
     except Exception as e:
-        print(f"❌ Error creating chat: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create chat: {str(e)}")
-
-@app.put("/api/chats/{chat_id}")
-async def update_chat(chat_id: str, chat_update: ChatUpdate):
-    try:
-        update_data = {}
-        if chat_update.title:
-            update_data["title"] = chat_update.title
-        if chat_update.updated_at:
-            update_data["updated_at"] = chat_update.updated_at
-            
-        result = supabase.table('chats').update(update_data).eq('id', chat_id).execute()
-        
-        return result.data[0]
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update chat: {str(e)}")
-
 
 if __name__ == "__main__":
     import uvicorn
