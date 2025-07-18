@@ -560,6 +560,50 @@ async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: 
         print(f"ERROR confirming upload: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to confirm upload: {str(e)}")
 
+
+@app.delete("/api/projects/{project_id}/files/{file_id}")
+async def delete_file(project_id: str, file_id: str, clerk_id: str):
+    try:
+        # Verify project exists and belongs to user
+        project_result = supabase.table('projects').select('id').eq('id', project_id).eq('clerk_id', clerk_id).execute()
+        
+        if not project_result.data:
+            raise HTTPException(status_code=404, detail="Project not found or access denied")
+        
+        # Get the file record to get the s3_key
+        file_result = supabase.table('project_documents').select('*').eq('id', file_id).eq('project_id', project_id).eq('clerk_id', clerk_id).execute()
+        
+        if not file_result.data:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        file_record = file_result.data[0]
+        s3_key = file_record['s3_key']
+        
+        # Delete from S3 first
+        try:
+            s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+            print(f"DEBUG: Deleted from S3: {s3_key}")
+        except Exception as s3_error:
+            print(f"WARNING: Failed to delete from S3: {s3_error}")
+            # Continue with database deletion even if S3 fails
+        
+        # Delete from database
+        delete_result = supabase.table('project_documents').delete().eq('id', file_id).eq('project_id', project_id).eq('clerk_id', clerk_id).execute()
+        
+        if not delete_result.data:
+            raise HTTPException(status_code=500, detail="Failed to delete file record")
+        
+        return {
+            "message": "File deleted successfully",
+            "data": delete_result.data[0]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR deleting file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
