@@ -6,6 +6,23 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from pydantic import BaseModel
 from typing import Optional
+import boto3
+from botocore.exceptions import ClientError
+import uuid
+from datetime import datetime, timedelta
+
+# Load environment variables
+load_dotenv()
+
+s3_client = boto3.client(
+    's3',
+    endpoint_url=os.getenv('AWS_ENDPOINT_URL_S3'),
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+    region_name=os.getenv('AWS_REGION')
+)
+
+BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
 
 # Pydantic Models
 class UserCreate(BaseModel):
@@ -51,11 +68,15 @@ class ProjectSettingsUpdate(BaseModel):
     vector_weight: Optional[float] = None
     keyword_weight: Optional[float] = None
 
-# Load environment variables
-load_dotenv()
+class FileUploadRequest(BaseModel):
+    filename: str
+    file_size: int
+    file_type: str
+
 
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
+
 
 if not supabase_url or not supabase_key:
     raise ValueError("Missing Supabase credentials in environment variables")
@@ -422,6 +443,122 @@ async def create_message(message: MessageCreate):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create message: {str(e)}")
+
+
+# File uploads
+
+@app.post("/api/projects/{project_id}/files/upload-url")
+async def get_upload_url(project_id: str, file_request: FileUploadRequest, clerk_id: str):
+    try:        
+        # Verify project exists and belongs to user
+        project_result = supabase.table('projects').select('id').eq('id', project_id).eq('clerk_id', clerk_id).execute()
+        
+        if not project_result.data:
+            raise HTTPException(status_code=404, detail="Project not found or access denied")
+        
+        # Generate unique S3 key
+        file_extension = file_request.filename.split('.')[-1] if '.' in file_request.filename else ''
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        unique_id = str(uuid.uuid4())[:8]
+        s3_key = f"projects/{project_id}/documents/{timestamp}_{unique_id}.{file_extension}"
+        
+        # Generate presigned URL (expires in 1 hour)
+        presigned_url = s3_client.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': BUCKET_NAME,
+                'Key': s3_key,
+                'ContentType': file_request.file_type
+            },
+            ExpiresIn=3600  # 1 hour
+        )
+        
+        # Create database record with pending status
+        document_result = supabase.table('project_documents').insert({
+            'project_id': project_id,
+            'original_filename': file_request.filename,
+            's3_key': s3_key,
+            'file_size': file_request.file_size,
+            'file_type': file_request.file_type,
+            'upload_status': 'pending',
+            'clerk_id': clerk_id
+        }).execute()
+        
+        if not document_result.data:
+            raise HTTPException(status_code=500, detail="Failed to create document record")
+                
+        return {
+            "message": "Upload URL generated successfully",
+            "data": {
+                "upload_url": presigned_url,
+                "s3_key": s3_key,
+                "document_id": document_result.data[0]['id']
+            }
+        }
+        
+    except Exception as e:
+        print(f"ERROR: {str(e)}")
+        print(f"ERROR TYPE: {type(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to generate upload URL: {str(e)}")
+
+@app.get("/api/projects/{project_id}/files")
+async def get_project_files(project_id: str, clerk_id: str):
+    try:
+        # Verify project exists and belongs to user
+        project_result = supabase.table('projects').select('id').eq('id', project_id).eq('clerk_id', clerk_id).execute()
+        
+        if not project_result.data:
+            raise HTTPException(status_code=404, detail="Project not found or access denied")
+        
+        # Get all files for this project
+        files_result = supabase.table('project_documents').select('*').eq('project_id', project_id).order('created_at', desc=True).execute()
+        
+        return {
+            "message": "Project files retrieved successfully",
+            "data": files_result.data or []
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get project files: {str(e)}")
+
+
+@app.post("/api/projects/{project_id}/files/confirm")
+async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: str):
+    try:
+        s3_key = confirm_request.get('s3_key')
+        
+        if not s3_key:
+            raise HTTPException(status_code=400, detail="s3_key is required")
+        
+        # Verify project exists and belongs to user
+        project_result = supabase.table('projects').select('id').eq('id', project_id).eq('clerk_id', clerk_id).execute()
+        
+        if not project_result.data:
+            raise HTTPException(status_code=404, detail="Project not found or access denied")
+        
+        # Update document status to completed
+        result = supabase.table('project_documents').update({
+            'upload_status': 'completed',
+            'updated_at': 'now()'
+        }).eq('s3_key', s3_key).eq('project_id', project_id).eq('clerk_id', clerk_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        return {
+            "message": "Upload confirmed successfully",
+            "data": result.data[0]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR confirming upload: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to confirm upload: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
