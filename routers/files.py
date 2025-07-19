@@ -46,7 +46,7 @@ async def get_upload_url(project_id: str, file_request: FileUploadRequest, clerk
             's3_key': s3_key,
             'file_size': file_request.file_size,
             'file_type': file_request.file_type,
-            'upload_status': 'pending',
+            'processing_status': 'uploading',
             'clerk_id': clerk_id
         }).execute()
         
@@ -108,7 +108,8 @@ async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: 
         
         # Update document status to completed
         result = supabase.table('project_documents').update({
-            'upload_status': 'completed',
+            'processing_status': 'queued',     
+            'progress_percentage': 0, 
             'updated_at': 'now()'
         }).eq('s3_key', s3_key).eq('project_id', project_id).eq('clerk_id', clerk_id).execute()
         
