@@ -115,6 +115,25 @@ async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: 
         
         if not result.data:
             raise HTTPException(status_code=404, detail="Document not found")
+
+        document = result.data[0]
+        document_id = document['id']
+
+        test_chunks = [
+            {
+                'document_id': document_id,
+                'content': f'Executive Summary: This is test chunk {i+1} from the document {document["original_filename"]}. This represents content that would be extracted during real document processing. It contains meaningful text that would help answer user questions about the document content.',
+                'chunk_index': i,
+                'page_number': 2,  
+                'type': "text",
+                'char_count': 30  
+            }
+            for i in range(6)  
+        ]
+
+        for chunk_data in test_chunks:
+            supabase.table('document_chunks').insert(chunk_data).execute()
+        
         
         return {
             "message": "Upload confirmed successfully",
@@ -170,3 +189,30 @@ async def delete_file(project_id: str, file_id: str, clerk_id: str):
     except Exception as e:
         print(f"ERROR deleting file: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}")
+
+
+@router.get("/api/projects/{project_id}/files/{file_id}/chunks")
+async def get_document_chunks(project_id: str, file_id: str, clerk_id: str):
+    try:
+        project_result = supabase.table('projects').select('id').eq('id', project_id).eq('clerk_id', clerk_id).execute()
+        
+        if not project_result.data:
+            raise HTTPException(status_code=404, detail="Project not found or access denied")
+        
+        doc_result = supabase.table('project_documents').select('id').eq('id', file_id).eq('project_id', project_id).execute()
+        
+        if not doc_result.data:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        chunks_result = supabase.table('document_chunks').select('*').eq('document_id', file_id).order('chunk_index').execute()
+        
+        return {
+            "message": "Document chunks retrieved successfully",
+            "data": chunks_result.data or []
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR getting chunks: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get document chunks: {str(e)}")
