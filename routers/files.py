@@ -1,8 +1,10 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import uuid
 from datetime import datetime
 from database import supabase, s3_client, BUCKET_NAME
+import asyncio
+
 
 router = APIRouter(
     tags=["files"]
@@ -91,9 +93,88 @@ async def get_project_files(project_id: str, clerk_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get project files: {str(e)}")
 
+async def simulate_document_processing(document_id: str, project_id: str):
+    """Simulate realistic document processing with status updates"""
+    
+    pipeline_steps = [
+        ('analysis', 1),     # status, seconds to wait
+        ('partitioning', 2),  
+        ('enrichment', 1),
+        ('chunking', 1),
+        ('embedding', 2),
+        ('storage', 1),
+        ('indexing', 1),
+        ('completed', 0)     # no wait for completed
+    ]
+    
+    try:
+        for i, (status, wait_time) in enumerate(pipeline_steps):
+            # Calculate progress percentage
+            progress = int((i / (len(pipeline_steps) - 1)) * 100)  # -1 because completed is 100%
+            
+            # Update status in database
+            supabase.table('project_documents').update({
+                'processing_status': status,
+                'progress_percentage': progress,
+                'updated_at': 'now()'
+            }).eq('id', document_id).execute()
+            
+            print(f"Document {document_id}: {status} ({progress}%)")
+            
+            # Wait before next step (except for completed)
+            if status != 'completed' and wait_time > 0:
+                await asyncio.sleep(wait_time)
+        
+        # Create mock chunks when processing is completed
+        if status == 'completed':
+            test_chunks = [
+                {
+                    'document_id': document_id,
+                    'content': f'Executive Summary: This is test chunk {i+1} from the document. This represents content that would be extracted during real document processing. It contains meaningful text that would help answer user questions about the document content.',
+                    'chunk_index': i,
+                    'page_number': (i % 5) + 1,  # Distribute across pages 1-5
+                    'type': "text",
+                    'char_count': 150 + (i * 20)  # Varying lengths
+                }
+                for i in range(6)  
+            ]
+            
+            # Add a couple of image and table chunks for variety
+            test_chunks.extend([
+                {
+                    'document_id': document_id,
+                    'content': 'Chart showing quarterly revenue growth: Q1: $2.1M, Q2: $2.8M, Q3: $3.2M, Q4: $3.9M. Shows consistent upward trend with 23% average quarterly growth.',
+                    'chunk_index': 6,
+                    'page_number': 3,
+                    'type': "image",
+                    'char_count': 0
+                },
+                {
+                    'document_id': document_id,
+                    'content': 'Performance comparison table: Model A achieved 94.2% accuracy, Model B: 87.5%, Model C: 96.8%. Model C shows best performance across all metrics.',
+                    'chunk_index': 7,
+                    'page_number': 4,
+                    'type': "table", 
+                    'char_count': 0
+                }
+            ])
+
+            # Insert all chunks
+            for chunk_data in test_chunks:
+                supabase.table('document_chunks').insert(chunk_data).execute()
+            
+            print(f"Document {document_id}: Created {len(test_chunks)} chunks")
+            
+    except Exception as e:
+        print(f"Error processing document {document_id}: {str(e)}")
+        # Mark as failed if something goes wrong
+        supabase.table('project_documents').update({
+            'processing_status': 'failed',
+            'updated_at': 'now()'
+        }).eq('id', document_id).execute()
 
 @router.post("/api/projects/{project_id}/files/confirm")
-async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: str):
+async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: str, background_tasks: BackgroundTasks):
     try:
         s3_key = confirm_request.get('s3_key')
         
@@ -106,7 +187,7 @@ async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: 
         if not project_result.data:
             raise HTTPException(status_code=404, detail="Project not found or access denied")
         
-        # Update document status to completed
+        # Update document status to queued (processing will start in background)
         result = supabase.table('project_documents').update({
             'processing_status': 'queued',     
             'progress_percentage': 0, 
@@ -119,25 +200,12 @@ async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: 
         document = result.data[0]
         document_id = document['id']
 
-        test_chunks = [
-            {
-                'document_id': document_id,
-                'content': f'Executive Summary: This is test chunk {i+1} from the document {document["original_filename"]}. This represents content that would be extracted during real document processing. It contains meaningful text that would help answer user questions about the document content.',
-                'chunk_index': i,
-                'page_number': 2,  
-                'type': "text",
-                'char_count': 30  
-            }
-            for i in range(6)  
-        ]
-
-        for chunk_data in test_chunks:
-            supabase.table('document_chunks').insert(chunk_data).execute()
-        
+        # Start background processing (this runs asynchronously)
+        background_tasks.add_task(simulate_document_processing, document_id, project_id)
         
         return {
-            "message": "Upload confirmed successfully",
-            "data": result.data[0]
+            "message": "Upload confirmed, processing started",
+            "data": document
         }
         
     except HTTPException:
@@ -145,6 +213,7 @@ async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: 
     except Exception as e:
         print(f"ERROR confirming upload: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to confirm upload: {str(e)}")
+
 
 
 @router.delete("/api/projects/{project_id}/files/{file_id}")
