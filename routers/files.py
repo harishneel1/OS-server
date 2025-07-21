@@ -60,7 +60,7 @@ async def get_upload_url(project_id: str, file_request: FileUploadRequest, clerk
             "data": {
                 "upload_url": presigned_url,
                 "s3_key": s3_key,
-                "document_id": document_result.data[0]['id']
+                "document": document_result.data[0]
             }
         }
         
