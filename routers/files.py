@@ -4,6 +4,9 @@ import uuid
 from datetime import datetime
 from database import supabase, s3_client, BUCKET_NAME
 import asyncio
+import os
+from unstructured.partition.pdf import partition_pdf
+from unstructured.chunking.title import chunk_by_title
 
 
 router = APIRouter(
@@ -93,85 +96,162 @@ async def get_project_files(project_id: str, clerk_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get project files: {str(e)}")
 
-async def simulate_document_processing(document_id: str, project_id: str):
-    """Simulate realistic document processing with status updates"""
-    
-    pipeline_steps = [
-        ('analysis', 1),     # status, seconds to wait
-        ('partitioning', 2),  
-        ('enrichment', 1),
-        ('chunking', 1),
-        ('embedding', 2),
-        ('storage', 1),
-        ('indexing', 1),
-        ('completed', 0)     # no wait for completed
-    ]
-    
-    try:
-        for i, (status, wait_time) in enumerate(pipeline_steps):
-            # Calculate progress percentage
-            progress = int((i / (len(pipeline_steps) - 1)) * 100)  # -1 because completed is 100%
-            
-            # Update status in database
-            supabase.table('project_documents').update({
-                'processing_status': status,
-                'progress_percentage': progress,
-                'updated_at': 'now()'
-            }).eq('id', document_id).execute()
-            
-            print(f"Document {document_id}: {status} ({progress}%)")
-            
-            # Wait before next step (except for completed)
-            if status != 'completed' and wait_time > 0:
-                await asyncio.sleep(wait_time)
-        
-        # Create mock chunks when processing is completed
-        if status == 'completed':
-            test_chunks = [
-                {
-                    'document_id': document_id,
-                    'content': f'Executive Summary: This is test chunk {i+1} from the document. This represents content that would be extracted during real document processing. It contains meaningful text that would help answer user questions about the document content.',
-                    'chunk_index': i,
-                    'page_number': (i % 5) + 1,  # Distribute across pages 1-5
-                    'type': "text",
-                    'char_count': 150 + (i * 20)  # Varying lengths
-                }
-                for i in range(6)  
-            ]
-            
-            # Add a couple of image and table chunks for variety
-            test_chunks.extend([
-                {
-                    'document_id': document_id,
-                    'content': 'Chart showing quarterly revenue growth: Q1: $2.1M, Q2: $2.8M, Q3: $3.2M, Q4: $3.9M. Shows consistent upward trend with 23% average quarterly growth.',
-                    'chunk_index': 6,
-                    'page_number': 3,
-                    'type': "image",
-                    'char_count': 0
-                },
-                {
-                    'document_id': document_id,
-                    'content': 'Performance comparison table: Model A achieved 94.2% accuracy, Model B: 87.5%, Model C: 96.8%. Model C shows best performance across all metrics.',
-                    'chunk_index': 7,
-                    'page_number': 4,
-                    'type': "table", 
-                    'char_count': 0
-                }
-            ])
 
-            # Insert all chunks
-            for chunk_data in test_chunks:
-                supabase.table('document_chunks').insert(chunk_data).execute()
-            
-            print(f"Document {document_id}: Created {len(test_chunks)} chunks")
-            
+
+
+
+def update_status(document_id: str, status: str, progress: int):
+    """Update document processing status"""
+    supabase.table('project_documents').update({
+        'processing_status': status,
+        'progress_percentage': progress,
+        'updated_at': 'now()'
+    }).eq('id', document_id).execute()
+    print(f"Document {document_id}: {status} ({progress}%)")
+
+
+async def step1_download_and_partition(document_id: str):
+    """Step 1: Download PDF from S3 and partition into elements"""
+    print(f"Step 1: Downloading and partitioning document {document_id}")
+    
+    # Get document info from database
+    doc_result = supabase.table('project_documents').select('*').eq('id', document_id).execute()
+    if not doc_result.data:
+        raise Exception("Document not found")
+        
+    document = doc_result.data[0]
+    s3_key = document['s3_key']
+    
+    # Download to temporary file
+    temp_file = f"/tmp/{document_id}.pdf"
+    s3_client.download_file(BUCKET_NAME, s3_key, temp_file)
+    
+    from unstructured.partition.pdf import partition_pdf
+    
+    elements = partition_pdf(
+        filename=temp_file,
+        strategy="hi_res",
+        infer_table_structure=True
+    )
+    
+    # Clean up temp file
+    os.remove(temp_file)
+    
+    print(f"✅ Extracted {len(elements)} elements from PDF")
+    return elements
+
+def step2_chunk_elements(elements):
+    """Step 2: Chunk elements using title-based strategy"""
+    print("Step 2: Chunking elements...")
+    
+    from unstructured.chunking.title import chunk_by_title
+    
+    chunks = chunk_by_title(
+        elements,
+        max_characters=3000,
+        new_after_n_chars=1000,
+        combine_text_under_n_chars=500
+    )
+    
+    print(f"✅ Created {len(chunks)} chunks from elements")
+    return chunks
+
+def step3_categorize_chunks(chunks):
+    """Step 3: Separate chunks into text and table chunks"""
+    print("Step 3: Categorizing chunks...")
+    
+    text_chunks = []
+    table_chunks = []
+    
+    for chunk in chunks:
+        chunk_type = "text"
+        content = chunk.text
+        original_content = None
+        
+        # Look for table elements in the original elements that formed this chunk
+        if hasattr(chunk, 'metadata') and hasattr(chunk.metadata, 'orig_elements'):
+            for orig_element in chunk.metadata.orig_elements:
+                if hasattr(orig_element, 'category') and orig_element.category == 'Table':
+                    if hasattr(orig_element.metadata, 'text_as_html') and orig_element.metadata.text_as_html:
+                        chunk_type = "table"
+                        original_content = orig_element.metadata.text_as_html
+                        break
+        
+        # Extract page number from metadata if available
+        page_num = 1
+        if hasattr(chunk, 'metadata') and hasattr(chunk.metadata, 'page_number'):
+            page_num = chunk.metadata.page_number
+        
+        chunk_data = {
+            'content': content,
+            'original_content': original_content,
+            'page_number': page_num,
+            'type': chunk_type,
+            'char_count': len(content)
+        }
+        
+        if chunk_type == "table":
+            table_chunks.append(chunk_data)
+        else:
+            text_chunks.append(chunk_data)
+    
+    print(f"✅ Found:")
+    print(f"   📝 Text chunks: {len(text_chunks)}")
+    print(f"   📊 Table chunks: {len(table_chunks)}")
+    
+    return text_chunks, table_chunks
+
+
+def step4_store_chunks(document_id: str, text_chunks: list, table_chunks: list):
+    """Step 4: Store all chunks in database"""
+    print("Step 4: Storing chunks in database...")
+    
+    all_chunks = text_chunks + table_chunks
+    
+    for i, chunk_data in enumerate(all_chunks):
+        # Add document_id and chunk_index
+        chunk_data.update({
+            'document_id': document_id,
+            'chunk_index': i
+        })
+        
+        supabase.table('document_chunks').insert(chunk_data).execute()
+    
+    print(f"✅ Stored {len(all_chunks)} chunks in database")
+    return len(all_chunks)
+
+async def process_document(document_id: str, project_id: str):
+    """Main orchestrator for document processing"""
+    try:
+        print(f"\n🔄 Starting document processing: {document_id}")
+        
+        # Step 1: Download and partition
+        update_status(document_id, 'analysis', 10)
+        update_status(document_id, 'partitioning', 30)
+        elements = await step1_download_and_partition(document_id)
+        
+        # Step 2: Chunk elements
+        update_status(document_id, 'chunking', 70)
+        chunks = step2_chunk_elements(elements)
+        
+        # Step 3: Categorize chunks
+        text_chunks, table_chunks = step3_categorize_chunks(chunks)
+        
+        # Step 4: Store chunks
+        total_chunks = step4_store_chunks(document_id, text_chunks, table_chunks)
+        
+        # Mark as completed
+        update_status(document_id, 'completed', 100)
+        print(f"✅ Document {document_id}: Processing completed with {total_chunks} chunks")
+        
     except Exception as e:
-        print(f"Error processing document {document_id}: {str(e)}")
-        # Mark as failed if something goes wrong
-        supabase.table('project_documents').update({
-            'processing_status': 'failed',
-            'updated_at': 'now()'
-        }).eq('id', document_id).execute()
+        print(f"❌ Error processing document {document_id}: {str(e)}")
+        update_status(document_id, 'failed', 0)
+        raise e
+
+
+
+
 
 @router.post("/api/projects/{project_id}/files/confirm")
 async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: str, background_tasks: BackgroundTasks):
@@ -201,7 +281,7 @@ async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: 
         document_id = document['id']
 
         # Start background processing (this runs asynchronously)
-        background_tasks.add_task(simulate_document_processing, document_id, project_id)
+        background_tasks.add_task(process_document, document_id, project_id)
         
         return {
             "message": "Upload confirmed, processing started",
