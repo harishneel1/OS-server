@@ -7,6 +7,7 @@ import asyncio
 import os
 from unstructured.partition.pdf import partition_pdf
 from unstructured.chunking.title import chunk_by_title
+from tasks import process_document_real
 
 
 router = APIRouter(
@@ -281,10 +282,12 @@ async def confirm_file_upload(project_id: str, confirm_request: dict, clerk_id: 
         document_id = document['id']
 
         # Start background processing (this runs asynchronously)
-        background_tasks.add_task(process_document, document_id, project_id)
+        # background_tasks.add_task(process_document, document_id, project_id)
+        task = process_document_real.delay(document_id, project_id)
+
         
         return {
-            "message": "Upload confirmed, processing started",
+            "message": "Upload confirmed, processing started with Celery",
             "data": document
         }
         
