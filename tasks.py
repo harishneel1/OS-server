@@ -24,31 +24,6 @@ def update_status(document_id: str, status: str, progress: int):
 
 
 @celery_app.task
-def process_document_simple(document_id: str, project_id: str):
-    """Simplified version - keep this for quick testing"""
-    try:
-        print(f"🔄 Starting SIMPLE Celery task for document: {document_id}")
-        
-        update_status(document_id, 'analysis', 20)
-        time.sleep(2)
-        
-        update_status(document_id, 'partitioning', 50)
-        time.sleep(3)
-        
-        update_status(document_id, 'chunking', 80)
-        time.sleep(2)
-        
-        update_status(document_id, 'completed', 100)
-        
-        print(f"✅ SIMPLE Celery task completed for document: {document_id}")
-        return {"status": "success", "document_id": document_id}
-        
-    except Exception as e:
-        print(f"❌ SIMPLE Celery task failed for document {document_id}: {str(e)}")
-        update_status(document_id, 'failed', 0)
-        return {"status": "error", "error": str(e)}
-
-@celery_app.task
 def process_document_real(document_id: str, project_id: str):
     """Real document processing with actual PDF partition and chunking"""
     try:
@@ -64,9 +39,12 @@ def process_document_real(document_id: str, project_id: str):
         chunks = chunk_elements(elements)
         
         # Step 3: Categorize chunks
-        text_chunks, table_chunks = categorize_chunks(chunks)
-        
-        # Step 4: Store chunks
+        raw_text_chunks, raw_table_chunks = categorize_chunks(chunks)
+
+        # Step 4: Prepare for database (add metadata)
+        text_chunks, table_chunks = convert_chunks_to_db_format(raw_text_chunks, raw_table_chunks)
+
+        # Step 5: Store chunks
         update_status(document_id, 'storage', 90)
         total_chunks = store_chunks(document_id, text_chunks, table_chunks)
         
@@ -124,46 +102,59 @@ def chunk_elements(elements):
     return chunks
 
 def categorize_chunks(chunks):
-    """Separate chunks into text and table chunks"""
+    """Separate chunks into text and table chunks - SIMPLE like Claude3.py"""
     print("📂 Categorizing chunks...")
     
     text_chunks = []
     table_chunks = []
     
+    # Simple categorization like Claude3.py
     for chunk in chunks:
-        chunk_type = "text"
-        content = chunk.text
-        original_content = None
+        chunk_type = str(type(chunk))
         
-        # Look for table elements in the original elements that formed this chunk
-        if hasattr(chunk, 'metadata') and hasattr(chunk.metadata, 'orig_elements'):
-            for orig_element in chunk.metadata.orig_elements:
-                if hasattr(orig_element, 'category') and orig_element.category == 'Table':
-                    if hasattr(orig_element.metadata, 'text_as_html') and orig_element.metadata.text_as_html:
-                        chunk_type = "table"
-                        original_content = orig_element.metadata.text_as_html
-                        break
-        
-        # Extract page number from metadata if available
-        page_num = 1
-        if hasattr(chunk, 'metadata') and hasattr(chunk.metadata, 'page_number'):
-            page_num = chunk.metadata.page_number
-        
-        chunk_data = {
-            'content': content,
-            'original_content': original_content,
-            'page_number': page_num,
-            'type': chunk_type,
-            'char_count': len(content)
-        }
-        
-        if chunk_type == "table":
-            table_chunks.append(chunk_data)
+        if 'CompositeElement' in chunk_type:
+            text_chunks.append(chunk)
+        elif 'TableChunk' in chunk_type:
+            table_chunks.append(chunk)
+        # If it's neither, we'll treat it as text
         else:
-            text_chunks.append(chunk_data)
+            text_chunks.append(chunk)
     
     print(f"✅ Found {len(text_chunks)} text chunks and {len(table_chunks)} table chunks")
     return text_chunks, table_chunks
+
+def convert_chunks_to_db_format(text_chunks, table_chunks):
+    """Convert unstructured chunks to database format"""
+    
+    db_text_chunks = []
+    db_table_chunks = []
+    
+    # Convert text chunks
+    for i, chunk in enumerate(text_chunks):
+        page_num = getattr(chunk.metadata, 'page_number', 1) if hasattr(chunk, 'metadata') else 1
+        
+        db_text_chunks.append({
+            'content': chunk.text,
+            'original_content': None,
+            'page_number': page_num,
+            'type': 'text',
+            'char_count': len(chunk.text)
+        })
+    
+    # Convert table chunks  
+    for i, chunk in enumerate(table_chunks):
+        page_num = getattr(chunk.metadata, 'page_number', 1) if hasattr(chunk, 'metadata') else 1
+        table_html = getattr(chunk.metadata, 'text_as_html', chunk.text) if hasattr(chunk, 'metadata') else chunk.text
+        
+        db_table_chunks.append({
+            'content': chunk.text,
+            'original_content': table_html,
+            'page_number': page_num,
+            'type': 'table',
+            'char_count': len(chunk.text)
+        })
+    
+    return db_text_chunks, db_table_chunks
 
 def store_chunks(document_id: str, text_chunks: list, table_chunks: list):
     """Store all chunks in database"""
