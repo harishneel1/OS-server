@@ -5,6 +5,8 @@ import os
 from unstructured.partition.pdf import partition_pdf
 from unstructured.chunking.title import chunk_by_title
 from database import s3_client, BUCKET_NAME
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
 
 # Create Celery app
 celery_app = Celery(
@@ -12,6 +14,9 @@ celery_app = Celery(
     broker='redis://localhost:6379/0',  # Redis connection
     backend='redis://localhost:6379/0'  # Where to store results
 )
+
+# Initialize LLM for summarization
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
 def update_status(document_id: str, status: str, progress: int):
     """Update document processing status"""
@@ -38,7 +43,7 @@ def process_document_real(document_id: str, project_id: str):
         update_status(document_id, 'chunking', 50)
         chunks = chunk_elements(elements)
         
-        # Step 3: Process CompositeElements
+        # Step 3: Process CompositeElements with AI summarization
         update_status(document_id, 'enrichment', 70)
         processed_chunks = process_composite_elements(chunks)
         
@@ -102,13 +107,15 @@ def chunk_elements(elements):
     return chunks
 
 def process_composite_elements(chunks):
-    """Process each CompositeElement and analyze its content types"""
-    print("📂 Processing CompositeElement chunks...")
+    """Process each CompositeElement and analyze its content types with AI summarization"""
+    print("📂 Processing CompositeElement chunks with AI summarization...")
     
     processed_chunks = []
     
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         if "CompositeElement" in str(type(chunk)):
+            print(f"   Processing chunk {i+1}/{len(chunks)}...")
+            
             # Start with basic info
             chunk_types = ["text"]  # Always has text
             tables_html = []
@@ -134,9 +141,6 @@ def process_composite_elements(chunks):
             # Get page number
             page_num = getattr(chunk.metadata, 'page_number', 1) if hasattr(chunk, 'metadata') else 1
             
-            # For now, content is just the text (no AI summarization yet)
-            content = chunk.text
-
             # Create original_content JSON structure
             original_content = {
                 "text": chunk.text
@@ -145,6 +149,16 @@ def process_composite_elements(chunks):
                 original_content["tables"] = tables_html
             if images_base64:
                 original_content["images"] = images_base64
+            
+            # Determine if we need AI summarization
+            needs_ai_summary = len(chunk_types) > 1  # Has tables or images
+            
+            if needs_ai_summary:
+                print(f"     Creating AI summary for mixed content chunk (types: {chunk_types})...")
+                content = create_ai_summary_for_chunk(chunk.text, tables_html, images_base64)
+            else:
+                # Pure text chunk - no AI needed
+                content = chunk.text
             
             processed_chunks.append({
                 'content': content,
@@ -155,10 +169,65 @@ def process_composite_elements(chunks):
             })
     
     print(f"✅ Processed {len(processed_chunks)} CompositeElement chunks")
-    for i, chunk in enumerate(processed_chunks[:3]):  # Show first 3 as example
-        print(f"   Chunk {i+1}: types={chunk['type']}, page={chunk['page_number']}")
-    
     return processed_chunks
+
+def create_ai_summary_for_chunk(text: str, tables_html: list, images_base64: list):
+    """Create AI summary for a chunk with mixed content (text + tables + images)"""
+    
+    # Build the text part of the prompt
+    text_content = f"TEXT CONTENT:\n{text}\n\n"
+    
+    # Add tables to the prompt
+    tables_content = ""
+    if tables_html:
+        tables_content = "TABLES:\n"
+        for i, table in enumerate(tables_html):
+            tables_content += f"Table {i+1}:\n{table}\n\n"
+    
+    # Create the message content for multi-modal input
+    message_content = [
+        {
+            "type": "text",
+            "text": f"""Create a comprehensive summary of this document content that will be used for semantic search and retrieval. Include specific data points, key concepts, entities, and numbers that users might search for.
+
+{text_content}{tables_content}
+
+INSTRUCTIONS:
+- Extract and mention specific data points, numbers, percentages, dates from tables
+- Include key entities, concepts, and technical terms
+- Describe visual elements and data trends from images  
+- Make the summary dense with searchable keywords
+- Focus on factual information that users would query
+- Limit to 50 words but pack with relevant details
+
+SUMMARY:"""
+        }
+    ]
+    
+    # Add images to the message
+    for i, image_base64 in enumerate(images_base64):
+        message_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+        })
+    
+    try:
+        message = HumanMessage(content=message_content)
+        response = llm.invoke([message])
+        ai_summary = response.content
+        
+        print(f"     ✅ AI summary created ({len(ai_summary)} chars)")
+        return ai_summary
+        
+    except Exception as e:
+        print(f"     ❌ Error creating AI summary: {e}")
+        # Fallback to basic summary
+        fallback = f"{text[:200]}..."
+        if tables_html:
+            fallback += f" [Contains {len(tables_html)} table(s)]"
+        if images_base64:
+            fallback += f" [Contains {len(images_base64)} image(s)]"
+        return fallback
 
 def store_chunks(document_id: str, processed_chunks: list):
     """Store all processed chunks in database"""
